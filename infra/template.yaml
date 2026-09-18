@@ -14,9 +14,35 @@ Resources:
         - AttributeName: id
           KeyType: HASH
 
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-documents-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
 Outputs:
   DocumentsTableName:
     Description: DynamoDB Documents Table Name
     Value: !Ref DocumentsTable
     Export:
       Name: !Sub ${AWS::StackName}-DocumentsTableName
+
+  DocumentsBucketName:
+    Description: S3 Documents Bucket Name
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentsBucketName
+
+  DocumentsBucketArn:
+    Description: S3 Documents Bucket ARN
+    Value: !GetAtt DocumentsBucket.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentsBucketArn
