@@ -1,0 +1,29 @@
+{
+  "name": "serverless-document-processing",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild --bundle --outfile=./dist/api.js --platform=node --target=node20 ./src/handlers/api.handler.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@hono/eslint-config": "^2.1.1",
+    "@types/node": "^26.1.1",
+    "aws-sdk-client-mock": "^4.1.0",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.10.0",
+    "npm-run-all2": "^9.0.2",
+    "prettier": "^3.9.8",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.1"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1135.0",
+    "@aws-sdk/lib-dynamodb": "^3.1135.0",
+    "hono": "^4.13.8"
+  }
+}
