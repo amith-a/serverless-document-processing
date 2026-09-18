@@ -1,0 +1,222 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createApp } from '../../src/api/app.js';
+import type { DocumentRepository } from '../../src/repositories/document.repository.js';
+import { DocumentService } from '../../src/services/document.service.js';
+import type { S3StorageService } from '../../src/services/s3.service.js';
+import type { Document } from '../../src/types/document.js';
+
+describe('HTTP API', () => {
+  let mockRepository: {
+    create: ReturnType<typeof vi.fn>;
+    getById: ReturnType<typeof vi.fn>;
+  };
+  let mockS3Service: {
+    getUploadUrl: ReturnType<typeof vi.fn>;
+    getObject: ReturnType<typeof vi.fn>;
+    putObject: ReturnType<typeof vi.fn>;
+  };
+  let documentService: DocumentService;
+  let app: ReturnType<typeof createApp>;
+
+  const sampleDocument: Document = {
+    id: 'doc-123',
+    filename: 'invoice.pdf',
+    contentType: 'application/pdf',
+    size: 2048,
+    status: 'UPLOADED',
+    s3Key: 'uploads/doc-123/original',
+    createdAt: '2026-09-18T10:00:00.000Z',
+    updatedAt: '2026-09-18T10:00:00.000Z',
+  };
+
+  beforeEach(() => {
+    mockRepository = {
+      create: vi.fn().mockResolvedValue(sampleDocument),
+      getById: vi.fn(),
+    };
+    mockS3Service = {
+      getUploadUrl: vi.fn().mockResolvedValue({
+        uploadUrl:
+          'https://s3.amazonaws.com/bucket/uploads/doc-123/original?presigned',
+        s3Key: 'uploads/doc-123/original',
+      }),
+      getObject: vi.fn(),
+      putObject: vi.fn(),
+    };
+
+    documentService = new DocumentService(
+      mockRepository as unknown as DocumentRepository,
+      mockS3Service as unknown as S3StorageService,
+      () => 'doc-123',
+    );
+
+    app = createApp(documentService);
+  });
+
+  describe('GET /', () => {
+    it('returns service name', async () => {
+      const res = await app.request('/');
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('Serverless Document Processing Pipeline');
+    });
+  });
+
+  describe('POST /documents', () => {
+    it('creates document and returns minimal response with 201 Created', async () => {
+      const payload = {
+        filename: 'invoice.pdf',
+        contentType: 'application/pdf',
+        size: 2048,
+      };
+
+      const res = await app.request('/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      expect(res.status).toBe(201);
+      const json = (await res.json()) as Record<string, unknown>;
+
+      expect(json).toEqual({
+        id: 'doc-123',
+        s3Key: 'uploads/doc-123/original',
+        uploadUrl:
+          'https://s3.amazonaws.com/bucket/uploads/doc-123/original?presigned',
+      });
+
+      expect(json.status).toBeUndefined();
+      expect(json.createdAt).toBeUndefined();
+      expect(json.updatedAt).toBeUndefined();
+
+      expect(mockRepository.create).toHaveBeenCalledTimes(1);
+      expect(mockS3Service.getUploadUrl).toHaveBeenCalledWith(
+        'doc-123',
+        'application/pdf',
+      );
+    });
+
+    it('returns 400 when filename is missing or empty', async () => {
+      const res = await app.request('/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: '',
+          contentType: 'application/pdf',
+          size: 100,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toContain('filename');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when contentType is missing or empty', async () => {
+      const res = await app.request('/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: 'test.pdf',
+          contentType: '  ',
+          size: 100,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toContain('contentType');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when size is zero, negative, or not an integer', async () => {
+      const invalidSizes = [0, -10, 12.5, '100'];
+
+      for (const size of invalidSizes) {
+        const res = await app.request('/documents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: 'test.pdf',
+            contentType: 'application/pdf',
+            size,
+          }),
+        });
+
+        expect(res.status).toBe(400);
+        const json = (await res.json()) as { error: string };
+        expect(json.error).toContain('size');
+      }
+
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when request body is invalid JSON', async () => {
+      const res = await app.request('/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: 'invalid-json{',
+      });
+
+      expect(res.status).toBe(400);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toBe('Invalid JSON payload');
+    });
+
+    it('propagates error and does not return upload info if DynamoDB creation fails', async () => {
+      mockRepository.create.mockRejectedValue(
+        new Error('DynamoDB write error'),
+      );
+
+      const res = await app.request('/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: 'invoice.pdf',
+          contentType: 'application/pdf',
+          size: 2048,
+        }),
+      });
+
+      expect(res.status).toBe(500);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.error).toBe('Internal Server Error');
+      expect(json.uploadUrl).toBeUndefined();
+      expect(json.s3Key).toBeUndefined();
+    });
+  });
+
+  describe('GET /documents/:id', () => {
+    it('returns document when it exists', async () => {
+      mockRepository.getById.mockResolvedValue(sampleDocument);
+
+      const res = await app.request('/documents/doc-123');
+
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as Document;
+      expect(json).toEqual(sampleDocument);
+      expect(mockRepository.getById).toHaveBeenCalledWith('doc-123');
+    });
+
+    it('returns 404 when document does not exist', async () => {
+      mockRepository.getById.mockResolvedValue(null);
+
+      const res = await app.request('/documents/doc-404');
+
+      expect(res.status).toBe(404);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toBe('Document not found');
+    });
+
+    it('returns 500 when repository throws an error', async () => {
+      mockRepository.getById.mockRejectedValue(new Error('DynamoDB timeout'));
+
+      const res = await app.request('/documents/doc-123');
+
+      expect(res.status).toBe(500);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toBe('Internal Server Error');
+    });
+  });
+});
