@@ -270,6 +270,26 @@ describe('HTTP API', () => {
       expect(mockRepository.getById).toHaveBeenCalledWith('doc-123');
     });
 
+    it('trims leading and trailing whitespace from document ID before repository lookup', async () => {
+      mockRepository.getById.mockResolvedValue(sampleDocument);
+
+      const res = await app.request('/documents/%20doc-123%20');
+
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as Document;
+      expect(json).toEqual(sampleDocument);
+      expect(mockRepository.getById).toHaveBeenCalledWith('doc-123');
+    });
+
+    it('returns 400 when document ID is whitespace only', async () => {
+      const res = await app.request('/documents/%20%20');
+
+      expect(res.status).toBe(400);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toBe('Document ID must be a non-empty string');
+      expect(mockRepository.getById).not.toHaveBeenCalled();
+    });
+
     it('returns 404 when document does not exist', async () => {
       mockRepository.getById.mockResolvedValue(null);
 
@@ -280,14 +300,16 @@ describe('HTTP API', () => {
       expect(json.error).toBe('Document not found');
     });
 
-    it('returns 500 when repository throws an error', async () => {
-      mockRepository.getById.mockRejectedValue(new Error('DynamoDB timeout'));
+    it('returns safe 500 response with exactly { error: "Internal Server Error" } when repository throws an error', async () => {
+      mockRepository.getById.mockRejectedValue(
+        new Error('DynamoDB timeout with sensitive internal details'),
+      );
 
       const res = await app.request('/documents/doc-123');
 
       expect(res.status).toBe(500);
-      const json = (await res.json()) as { error: string };
-      expect(json.error).toBe('Internal Server Error');
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json).toEqual({ error: 'Internal Server Error' });
     });
   });
 });

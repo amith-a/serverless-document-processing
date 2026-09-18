@@ -120,4 +120,47 @@ describe('DocumentService - Isolated Unit Tests', () => {
       );
     });
   });
+
+  describe('getDocument()', () => {
+    const sampleDoc: Document = {
+      id: 'doc-fixed-123',
+      filename: 'invoice.pdf',
+      contentType: 'application/pdf',
+      size: 2048,
+      status: 'UPLOADED',
+      s3Key: 'uploads/doc-fixed-123/original',
+      createdAt: '2026-09-18T10:00:00.000Z',
+      updatedAt: '2026-09-18T10:00:00.000Z',
+    };
+
+    it('returns document when document is found in repository', async () => {
+      mockRepository.getById.mockResolvedValue(sampleDoc);
+
+      const result = await service.getDocument('doc-fixed-123');
+
+      expect(mockRepository.getById).toHaveBeenCalledTimes(1);
+      expect(mockRepository.getById).toHaveBeenCalledWith('doc-fixed-123');
+      expect(result).toEqual(sampleDoc);
+    });
+
+    it('returns null when document is not found in repository', async () => {
+      mockRepository.getById.mockResolvedValue(null);
+
+      const result = await service.getDocument('doc-missing-404');
+
+      expect(mockRepository.getById).toHaveBeenCalledTimes(1);
+      expect(mockRepository.getById).toHaveBeenCalledWith('doc-missing-404');
+      expect(result).toBeNull();
+    });
+
+    it('propagates error when repository throws an error', async () => {
+      mockRepository.getById.mockRejectedValue(
+        new Error('DynamoDB read failure'),
+      );
+
+      await expect(service.getDocument('doc-fixed-123')).rejects.toThrow(
+        'DynamoDB read failure',
+      );
+    });
+  });
 });
