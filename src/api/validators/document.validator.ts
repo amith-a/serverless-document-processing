@@ -15,7 +15,7 @@ export type ValidationResult<T> = ValidationSuccess<T> | ValidationFailure;
 export function validateCreateDocumentRequest(
   body: unknown,
 ): ValidationResult<CreateDocumentInput> {
-  if (!body || typeof body !== 'object') {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return {
       success: false,
       error: 'Request body must be a JSON object',

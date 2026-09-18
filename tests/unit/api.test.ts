@@ -96,37 +96,85 @@ describe('HTTP API', () => {
       );
     });
 
-    it('returns 400 when filename is missing or empty', async () => {
-      const res = await app.request('/documents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filename: '',
-          contentType: 'application/pdf',
-          size: 100,
-        }),
-      });
+    it('returns 400 when request body is not a JSON object (e.g. array or primitive)', async () => {
+      const nonObjectBodies = [
+        JSON.stringify([1, 2, 3]),
+        JSON.stringify('a plain string'),
+        JSON.stringify(12345),
+      ];
 
-      expect(res.status).toBe(400);
-      const json = (await res.json()) as { error: string };
-      expect(json.error).toContain('filename');
+      for (const body of nonObjectBodies) {
+        const res = await app.request('/documents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        });
+
+        expect(res.status).toBe(400);
+        const json = (await res.json()) as { error: string };
+        expect(json.error).toBe('Request body must be a JSON object');
+      }
+
       expect(mockRepository.create).not.toHaveBeenCalled();
     });
 
-    it('returns 400 when contentType is missing or empty', async () => {
+    it('returns 400 when filename is missing or whitespace only', async () => {
+      const invalidFilenames = ['', '   ', undefined];
+
+      for (const filename of invalidFilenames) {
+        const res = await app.request('/documents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename,
+            contentType: 'application/pdf',
+            size: 100,
+          }),
+        });
+
+        expect(res.status).toBe(400);
+        const json = (await res.json()) as { error: string };
+        expect(json.error).toContain('filename');
+      }
+
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when contentType is missing or whitespace only', async () => {
+      const invalidContentTypes = ['', '   ', undefined];
+
+      for (const contentType of invalidContentTypes) {
+        const res = await app.request('/documents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: 'invoice.pdf',
+            contentType,
+            size: 100,
+          }),
+        });
+
+        expect(res.status).toBe(400);
+        const json = (await res.json()) as { error: string };
+        expect(json.error).toContain('contentType');
+      }
+
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when size is missing', async () => {
       const res = await app.request('/documents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          filename: 'test.pdf',
-          contentType: '  ',
-          size: 100,
+          filename: 'invoice.pdf',
+          contentType: 'application/pdf',
         }),
       });
 
       expect(res.status).toBe(400);
       const json = (await res.json()) as { error: string };
-      expect(json.error).toContain('contentType');
+      expect(json.error).toContain('size');
       expect(mockRepository.create).not.toHaveBeenCalled();
     });
 
@@ -162,6 +210,29 @@ describe('HTTP API', () => {
       expect(res.status).toBe(400);
       const json = (await res.json()) as { error: string };
       expect(json.error).toBe('Invalid JSON payload');
+    });
+
+    it('propagates error as safe 500 when S3 presigned URL generation fails', async () => {
+      mockS3Service.getUploadUrl.mockRejectedValue(
+        new Error('S3 internal KMS decryption failed secret-key-details'),
+      );
+
+      const res = await app.request('/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: 'invoice.pdf',
+          contentType: 'application/pdf',
+          size: 2048,
+        }),
+      });
+
+      expect(res.status).toBe(500);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json).toEqual({ error: 'Internal Server Error' });
+      expect(json.uploadUrl).toBeUndefined();
+      expect(json.s3Key).toBeUndefined();
+      expect(mockRepository.create).not.toHaveBeenCalled();
     });
 
     it('propagates error and does not return upload info if DynamoDB creation fails', async () => {
