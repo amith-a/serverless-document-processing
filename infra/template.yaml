@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless Document Processing Pipeline Infrastructure
+
+Resources:
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-documents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+Outputs:
+  DocumentsTableName:
+    Description: DynamoDB Documents Table Name
+    Value: !Ref DocumentsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentsTableName
