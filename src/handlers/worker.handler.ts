@@ -97,8 +97,36 @@ async function processSqsRecord(
       await repository.updateStatus(documentId, 'UPLOADED', 'PROCESSING');
     } catch (error) {
       if (error instanceof ConditionalCheckFailedError) {
+        const currentDoc = await repository.getById(documentId);
+        if (!currentDoc) {
+          throw new Error(
+            `Document ${documentId} not found in repository despite condition check failure`,
+          );
+        }
+
+        if (currentDoc.status === 'COMPLETED') {
+          console.info(
+            `[Worker] Document ${documentId} is already COMPLETED. Skipping duplicate delivery.`,
+          );
+          return;
+        }
+
+        if (currentDoc.status === 'FAILED') {
+          console.info(
+            `[Worker] Document ${documentId} is in FAILED status. Skipping delivery.`,
+          );
+          return;
+        }
+
+        if (currentDoc.status === 'PROCESSING') {
+          console.warn(
+            `[Worker] Document ${documentId} is already in PROCESSING status. Acknowledging and skipping as a duplicate/in-flight delivery.`,
+          );
+          return;
+        }
+
         console.warn(
-          `[Worker] Document ${documentId} could not be transitioned from UPLOADED to PROCESSING (condition check failed). Skipping duplicate delivery.`,
+          `[Worker] Document ${documentId} is in status ${currentDoc.status}. Skipping duplicate delivery.`,
         );
         return;
       }

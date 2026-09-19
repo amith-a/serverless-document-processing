@@ -10,6 +10,7 @@ describe('Worker Lambda Handler - Unit Tests', () => {
   let mockRepository: {
     updateStatus: ReturnType<typeof vi.fn>;
     updateProcessingResult: ReturnType<typeof vi.fn>;
+    getById: ReturnType<typeof vi.fn>;
   };
   let mockS3Service: {
     getObject: ReturnType<typeof vi.fn>;
@@ -68,6 +69,10 @@ describe('Worker Lambda Handler - Unit Tests', () => {
     mockRepository = {
       updateStatus: vi.fn().mockResolvedValue({}),
       updateProcessingResult: vi.fn().mockResolvedValue({}),
+      getById: vi.fn().mockResolvedValue({
+        id: 'doc-test-123',
+        status: 'PROCESSING',
+      }),
     };
     mockS3Service = {
       getObject: vi
@@ -84,7 +89,7 @@ describe('Worker Lambda Handler - Unit Tests', () => {
     });
   });
 
-  it('successfully processes valid S3 ObjectCreated event in SQS message', async () => {
+  it('first claim succeeds: processes valid S3 ObjectCreated event in SQS message', async () => {
     const event = createSqsEvent([
       { bucket: 'my-bucket', key: 'uploads/doc-test-123/original' },
     ]);
@@ -147,10 +152,14 @@ describe('Worker Lambda Handler - Unit Tests', () => {
     );
   });
 
-  it('handles duplicate delivery gracefully when document is already claimed (idempotency)', async () => {
+  it('When document is already PROCESSING, second worker terminates gracefully without side effects', async () => {
     mockRepository.updateStatus.mockRejectedValue(
       new ConditionalCheckFailedError('Document already claimed'),
     );
+    mockRepository.getById.mockResolvedValue({
+      id: 'doc-duplicate',
+      status: 'PROCESSING',
+    });
 
     const event = createSqsEvent([
       { bucket: 'my-bucket', key: 'uploads/doc-duplicate/original' },
@@ -160,9 +169,96 @@ describe('Worker Lambda Handler - Unit Tests', () => {
     await expect(handler(event)).resolves.toBeUndefined();
 
     expect(mockRepository.updateStatus).toHaveBeenCalledTimes(1);
+    expect(mockRepository.getById).toHaveBeenCalledWith('doc-duplicate');
     expect(mockS3Service.getObject).not.toHaveBeenCalled();
     expect(mockS3Service.putObject).not.toHaveBeenCalled();
     expect(mockRepository.updateProcessingResult).not.toHaveBeenCalled();
+  });
+
+  it('completed document behavior: acknowledges and skips duplicate delivery without re-processing', async () => {
+    mockRepository.updateStatus.mockRejectedValue(
+      new ConditionalCheckFailedError('Document already claimed'),
+    );
+    mockRepository.getById.mockResolvedValue({
+      id: 'doc-completed',
+      status: 'COMPLETED',
+      processedS3Key: 'processed/doc-completed/result',
+    });
+
+    const event = createSqsEvent([
+      { bucket: 'my-bucket', key: 'uploads/doc-completed/original' },
+    ]);
+
+    await expect(handler(event)).resolves.toBeUndefined();
+
+    expect(mockRepository.updateStatus).toHaveBeenCalledTimes(1);
+    expect(mockRepository.getById).toHaveBeenCalledWith('doc-completed');
+    expect(mockS3Service.getObject).not.toHaveBeenCalled();
+    expect(mockS3Service.putObject).not.toHaveBeenCalled();
+    expect(mockRepository.updateProcessingResult).not.toHaveBeenCalled();
+  });
+
+  it('failed document behavior: acknowledges and skips re-processing failed document', async () => {
+    mockRepository.updateStatus.mockRejectedValue(
+      new ConditionalCheckFailedError('Document already claimed'),
+    );
+    mockRepository.getById.mockResolvedValue({
+      id: 'doc-failed',
+      status: 'FAILED',
+    });
+
+    const event = createSqsEvent([
+      { bucket: 'my-bucket', key: 'uploads/doc-failed/original' },
+    ]);
+
+    await expect(handler(event)).resolves.toBeUndefined();
+
+    expect(mockRepository.updateStatus).toHaveBeenCalledTimes(1);
+    expect(mockRepository.getById).toHaveBeenCalledWith('doc-failed');
+    expect(mockS3Service.getObject).not.toHaveBeenCalled();
+    expect(mockS3Service.putObject).not.toHaveBeenCalled();
+    expect(mockRepository.updateProcessingResult).not.toHaveBeenCalled();
+  });
+
+  it('partial-processing behavior: safely handles retry when document completed prior to crash', async () => {
+    // Scenario: Execution 1 claimed, wrote S3, updated DynamoDB to COMPLETED, then crashed before SQS ack.
+    // Execution 2 (retry) receives the message:
+    mockRepository.updateStatus.mockRejectedValue(
+      new ConditionalCheckFailedError('Document already completed'),
+    );
+    mockRepository.getById.mockResolvedValue({
+      id: 'doc-partial',
+      status: 'COMPLETED',
+      processedS3Key: 'processed/doc-partial/result',
+    });
+
+    const event = createSqsEvent([
+      { bucket: 'my-bucket', key: 'uploads/doc-partial/original' },
+    ]);
+
+    // Retry should safely acknowledge without re-writing or corrupting state
+    await expect(handler(event)).resolves.toBeUndefined();
+
+    expect(mockRepository.updateStatus).toHaveBeenCalledTimes(1);
+    expect(mockRepository.getById).toHaveBeenCalledWith('doc-partial');
+    expect(mockS3Service.getObject).not.toHaveBeenCalled();
+    expect(mockS3Service.putObject).not.toHaveBeenCalled();
+    expect(mockRepository.updateProcessingResult).not.toHaveBeenCalled();
+  });
+
+  it('throws error when document is missing from repository on claim conditional failure', async () => {
+    mockRepository.updateStatus.mockRejectedValue(
+      new ConditionalCheckFailedError('Condition check failed'),
+    );
+    mockRepository.getById.mockResolvedValue(null);
+
+    const event = createSqsEvent([
+      { bucket: 'my-bucket', key: 'uploads/doc-missing/original' },
+    ]);
+
+    await expect(handler(event)).rejects.toThrow(
+      'Document doc-missing not found in repository despite condition check failure',
+    );
   });
 
   it('re-throws error when S3 getObject fails and does not transition document to FAILED before SQS retries', async () => {
@@ -265,5 +361,32 @@ describe('Worker Lambda Handler - Unit Tests', () => {
     await expect(handler(event)).rejects.toThrow(
       'S3 key does not match expected upload pattern: processed/doc-123/result',
     );
+  });
+
+  it('re-throws error when processor fails to trigger native SQS retry and does not update result', async () => {
+    const customHandler = createWorkerHandler({
+      repository: mockRepository as unknown as DocumentRepository,
+      s3Service: mockS3Service as unknown as S3StorageService,
+      processor: () => {
+        throw new Error('Deterministic processing error');
+      },
+    });
+
+    const event = createSqsEvent([
+      { bucket: 'my-bucket', key: 'uploads/doc-proc-err/original' },
+    ]);
+
+    await expect(customHandler(event)).rejects.toThrow(
+      'Deterministic processing error',
+    );
+
+    expect(mockRepository.updateStatus).toHaveBeenCalledTimes(1);
+    expect(mockRepository.updateStatus).toHaveBeenCalledWith(
+      'doc-proc-err',
+      'UPLOADED',
+      'PROCESSING',
+    );
+    expect(mockS3Service.putObject).not.toHaveBeenCalled();
+    expect(mockRepository.updateProcessingResult).not.toHaveBeenCalled();
   });
 });
