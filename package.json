@@ -2,7 +2,7 @@
   "name": "serverless-document-processing",
   "type": "module",
   "scripts": {
-    "build": "esbuild --bundle --outfile=./dist/api.js --platform=node --target=node20 ./src/handlers/api.handler.ts",
+    "build": "esbuild --bundle --outdir=./dist --platform=node --target=node20 api=./src/handlers/api.handler.ts worker=./src/handlers/worker.handler.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write .",

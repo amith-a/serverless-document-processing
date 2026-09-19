@@ -14,8 +14,42 @@ Resources:
         - AttributeName: id
           KeyType: HASH
 
+  DocumentProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-dlq
+      MessageRetentionPeriod: 1209600
+
+  DocumentProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-queue
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocumentProcessingDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  DocumentProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DocumentProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3BucketToSendMessages
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DocumentProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:aws:s3:::${AWS::StackName}-documents-${AWS::AccountId}
+
   DocumentsBucket:
     Type: AWS::S3::Bucket
+    DependsOn: DocumentProcessingQueuePolicy
     Properties:
       BucketName: !Sub ${AWS::StackName}-documents-${AWS::AccountId}
       PublicAccessBlockConfiguration:
@@ -27,6 +61,15 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt DocumentProcessingQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
 
   ApiFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -86,6 +129,87 @@ Resources:
         Variables:
           TABLE_NAME: !Ref DocumentsTable
           BUCKET_NAME: !Ref DocumentsBucket
+
+  WorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-worker
+      RetentionInDays: 14
+
+  WorkerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-worker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${WorkerFunctionLogGroup.Arn}:*
+        - PolicyName: DynamoDbAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DocumentsTable.Arn
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub ${DocumentsBucket.Arn}/uploads/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub ${DocumentsBucket.Arn}/processed/*
+        - PolicyName: SqsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt DocumentProcessingQueue.Arn
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WorkerFunctionLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-worker
+      Runtime: nodejs20.x
+      Handler: worker.handler
+      Code: ../dist
+      Role: !GetAtt WorkerFunctionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DocumentsTable
+          BUCKET_NAME: !Ref DocumentsBucket
+
+  WorkerFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DocumentProcessingQueue.Arn
+      FunctionName: !GetAtt WorkerFunction.Arn
+      BatchSize: 1
+      Enabled: true
 
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
@@ -160,3 +284,33 @@ Outputs:
     Value: !Ref HttpApi
     Export:
       Name: !Sub ${AWS::StackName}-HttpApiId
+
+  DocumentProcessingQueueUrl:
+    Description: SQS Document Processing Queue URL
+    Value: !Ref DocumentProcessingQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentProcessingQueueUrl
+
+  DocumentProcessingQueueArn:
+    Description: SQS Document Processing Queue ARN
+    Value: !GetAtt DocumentProcessingQueue.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentProcessingQueueArn
+
+  DocumentProcessingDeadLetterQueueUrl:
+    Description: SQS Document Processing Dead Letter Queue URL
+    Value: !Ref DocumentProcessingDeadLetterQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentProcessingDeadLetterQueueUrl
+
+  DocumentProcessingDeadLetterQueueArn:
+    Description: SQS Document Processing Dead Letter Queue ARN
+    Value: !GetAtt DocumentProcessingDeadLetterQueue.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentProcessingDeadLetterQueueArn
+
+  WorkerFunctionArn:
+    Description: Worker Lambda Function ARN
+    Value: !GetAtt WorkerFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-WorkerFunctionArn
