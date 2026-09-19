@@ -2,7 +2,7 @@ import baseConfig from '@hono/eslint-config';
 
 export default [
   {
-    ignores: ['dist/**', 'eslint.config.js'],
+    ignores: ['dist/**', 'eslint.config.js', '**/.aws-sam/**'],
   },
   ...baseConfig,
   {

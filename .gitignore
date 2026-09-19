@@ -1,6 +1,7 @@
 # prod
 dist/
 lambda.zip
+infra/packaged.yaml
 
 # dev
 .yarn/
@@ -30,5 +31,5 @@ lerna-debug.log*
 
 # misc
 .DS_Store
-
+**/.aws-sam/
 .local/
