@@ -1,318 +1,264 @@
 # Serverless Document Processing Pipeline
 
-A backend-focused serverless document processing pipeline built with **Node.js**, **TypeScript**, **Hono**, and **AWS services**.
+A backend serverless pipeline built with **Node.js**, **TypeScript**, **Hono**, and **AWS services** (API Gateway, Lambda, S3, SQS, DynamoDB, CloudFormation, CloudWatch).
 
-The objective of this project is to demonstrate clear, disciplined engineering decisions: event-driven architecture, asynchronous processing, idempotency, retry and DLQ handling, least-privilege IAM, and Infrastructure as Code without unnecessary frameworks or abstractions.
+Demonstrates asynchronous event-driven processing, idempotency via conditional writes, native retry/DLQ handling, least-privilege IAM, and Infrastructure as Code without unnecessary abstractions.
 
 ---
 
 ## 1. Architecture
 
 ```text
-                         Client / CLI
-                              |
-                              v
-                      +---------------+
-                      |  API Gateway  |
-                      |   HTTP API    |
-                      +-------+-------+
-                              |
-                              v
-                      +---------------+
-                      |  API Lambda   |
-                      |    (Hono)     |
-                      +-------+-------+
-                              |
-                       +------+------+
-                       |             |
-                       v             v
-                      S3         DynamoDB
-                       |
-                ObjectCreated
-                       |
-                       v
-                      SQS  ──> DLQ
-                       |
-                       v
-                +--------------+
-                | Worker Lambda|
-                +------+-------+
-                       |
-                  +----+----+
-                  |         |
-                  v         v
-                 S3      DynamoDB
+ Client / Node CLI
+        |
+        v
++---------------+
+|  API Gateway  | (HTTP API)
++-------+-------+
+        |
+        v
++---------------+
+|  API Lambda   | (Hono HTTP application)
++-------+-------+
+        |
+ +------+------+
+ |             |
+ v             v
+S3         DynamoDB (Metadata & state: UPLOADED)
+ |
+ObjectCreated (uploads/*)
+ |
+ v
+SQS  ──(3 retries)──> SQS DLQ
+ |
+ v
++---------------+
+| Worker Lambda | (Text metrics & JSON output)
++-------+-------+
+        |
+ +------+------+
+ |             |
+ v             v
+S3         DynamoDB (State: COMPLETED)
+(processed/*)
 ```
 
-The API Lambda and Worker Lambda have strict separation of concerns:
+The API Lambda and Worker Lambda are strictly decoupled:
 
-- The API Lambda handles synchronous HTTP requests and issues presigned upload instructions.
-- The Worker Lambda handles asynchronous document processing directly from SQS.
-- The Worker Lambda never communicates directly with the API Lambda.
-
----
-
-## 2. Hono's Role
-
-[Hono](https://hono.dev/) is used strictly as the HTTP application layer inside the API Lambda:
-
-- **Responsibilities**:
-  - Request routing (`POST /documents`, `GET /documents/:id`)
-  - Request validation integration
-  - HTTP error handling and status code mapping
-  - Response payload construction
-- **Explicit Boundary**:
-  - Hono is **not** used in the Worker Lambda.
-  - Hono does **not** manage AWS infrastructure, SQS events, document processing, or DynamoDB data modeling.
-  - Route handlers remain thin, delegating business logic to domain services and repositories.
+- **API Lambda**: Synchronous HTTP entrypoint issuing presigned S3 upload URLs.
+- **Worker Lambda**: Asynchronous processing engine reading from S3 and writing results.
+- **Independence**: The Worker never communicates directly with the API Lambda.
 
 ---
 
-## 3. API Flow
+## 2. Core Architectural Decisions
+
+- **Why Hono?** Ultra-lightweight, type-safe HTTP router with near-zero cold-start overhead (~1.7 MB bundled Lambda package).
+- **Why no Hono in Worker?** SQS events are native AWS event payloads, not HTTP requests. Wrapping an SQS event in an HTTP framework is an unnecessary abstraction.
+- **Why asynchronous processing?** Prevents API Gateway 30s timeouts, preserves low API latency, and absorbs traffic spikes independently of API capacity.
+- **Why SQS?** Buffers notifications, levels concurrency spikes, and provides native visibility timeouts with Dead Letter Queue isolation.
+- **Why DynamoDB?** Serverless single-digit millisecond key-value store with atomic **conditional writes** and no connection-pooling bottlenecks.
+- **Why conditional writes?** Solves at-least-once SQS duplicate message delivery. Exactly one worker claims the document; concurrent duplicates are safely skipped without external distributed locks.
+- **Why Floci is local only?** Keeps application code and CloudFormation 100% AWS-native (`no if local`, `no if floci`), eliminating cloud-emulator drift.
+- **Why unit tests don't require AWS?** 100% offline mocks (`aws-sdk-client-mock`) execute in <2 seconds without network, credentials, or Docker.
+- **Why no OCR / AI?** Deliberate scope discipline. Focuses on backend distributed systems patterns rather than external API dependencies.
+
+---
+
+## 3. API Specification
 
 ### `POST /documents`
 
-Creates document metadata and returns a presigned URL for direct S3 client upload:
+Registers document metadata and returns an S3 presigned PUT URL.
 
-```text
-Client Request ──> API Gateway ──> API Lambda (Hono)
-                                          │
-                                   Validate Input
-                                          │
-                       ┌──────────────────┴──────────────────┐
-                       ▼                                     ▼
-             Generate S3 Presigned URL             Save Document to DynamoDB
-             (uploads/{id}/original)                   (status: UPLOADED)
-                       │                                     │
-                       └──────────────────┬──────────────────┘
-                                          ▼
-                               Minimal HTTP Response:
-                       { id, s3Key, uploadUrl }
-```
-
-- **Minimal Contract**: Returns strictly `{ id, s3Key, uploadUrl }`. Internal fields (`status`, `createdAt`, `updatedAt`) are not exposed.
-- **Atomicity**: If DynamoDB persistence fails, the operation rejects and no upload information is returned.
-- **No In-Band Processing**: The API Lambda never processes the document.
+- **Request**:
+  ```json
+  { "filename": "report.txt", "contentType": "text/plain", "size": 1024 }
+  ```
+- **Response (`201 Created`)**:
+  ```json
+  {
+    "id": "uuid",
+    "s3Key": "uploads/uuid/original",
+    "uploadUrl": "https://bucket.s3.amazonaws.com/uploads/uuid/original?..."
+  }
+  ```
+- **Errors**: `400 Bad Request` (invalid body/params), `409 Conflict` (duplicate ID), `500 Internal Server Error` (masked safely).
 
 ### `GET /documents/:id`
 
-Retrieves document metadata and processing status:
+Retrieves document metadata and processing status.
 
-- Validates the `id` parameter (trims whitespace, rejects blank IDs).
-- Queries DynamoDB by primary key `id`.
-- Returns `200 OK` with the complete `Document` domain object, or `404 Not Found` if missing.
-
----
-
-## 4. S3 Flow
-
-- **Bucket Configuration**: Private bucket, public access completely blocked, server-side AES-256 encryption.
-- **Deterministic Keys**:
-  - Uploads: `uploads/{document-id}/original`
-  - Processed Output: `processed/{document-id}/result`
-- **Prefix Isolation**: S3 event notifications trigger only on the `uploads/` prefix. This strictly prevents processed results in `processed/` from causing infinite processing loops.
+- **Response (`200 OK`)**: Returns full document object (`id`, `filename`, `status`, `s3Key`, `processedS3Key`, `createdAt`, `updatedAt`).
+- **Response (`404 Not Found`)**: `{ "error": "Document not found" }`.
 
 ---
 
-## 5. SQS & Asynchronous Messaging
+## 4. Document Lifecycle & State Machine
 
 ```text
-S3 ObjectCreated (uploads/*) ──> SQS Main Queue ──(redrive)──> SQS DLQ
-                                       │
-                                EventSourceMapping
-                                       │
-                                       ▼
-                                 Worker Lambda
+UPLOADED ──(conditional claim)──> PROCESSING ──(worker completion)──> COMPLETED
 ```
 
-- **Main Queue**: Buffers document upload notifications from S3.
-- **Queue Policy**: Restricted strictly so that only the designated S3 bucket ARN can send messages to the queue.
-- **Dead Letter Queue (DLQ)**: Captures poison messages or events that fail after the maximum receive count.
-- **Decoupling**: Decouples document ingest from processing capacity and absorption of load spikes.
+- **`UPLOADED`**: Set on document creation by API Lambda.
+- **`PROCESSING`**: Claimed by Worker Lambda via conditional write:
+  ```text
+  attribute_exists(id) AND #status = 'UPLOADED'
+  ```
+- **`COMPLETED`**: Set when processed result JSON is saved to S3.
+- **Role of `FAILED`**: A reserved terminal domain state for DLQ exhaustion or operator remediation. Worker processing errors are **re-thrown** for native SQS retry rather than marked `FAILED` prematurely.
+
+---
+
+## 5. S3 & SQS Pipeline
+
+- **S3 Prefix Isolation**:
+  - `uploads/{id}/original` (raw uploads)
+  - `processed/{id}/result` (worker output JSON)
+  - Notifications trigger **only** on `uploads/` to prevent infinite processing loops.
+- **S3 Security**: Private bucket, all public access blocked, AES256 server-side encryption, TLS-only bucket policy.
+- **SQS Queue**:
+  - `VisibilityTimeout`: 180s (6x Lambda timeout of 30s).
+  - `RedrivePolicy`: `maxReceiveCount: 3` targeting Dead Letter Queue (DLQ).
+  - Queue policy restricts `SendMessage` strictly to the S3 bucket source ARN.
+- **DLQ**: 14-day retention (`1209600`s) for poisoned or permanently failing messages.
 
 ---
 
 ## 6. Worker Processing
 
-The Worker Lambda is invoked directly by AWS Lambda Event Source Mapping from SQS:
+The Worker Lambda (`src/handlers/worker.handler.ts`):
 
-```text
-SQS Event ──> Validate Event ──> Claim Document (Conditional Write)
-                                          │
-                   ┌──────────────────────┴──────────────────────┐
-                   ▼                                             ▼
-             Read S3 Object                                Update DynamoDB
-                   │                                      (status: FAILED)
-             Process Content                                     │
-                   │                                       Allow SQS Retry
-             Write S3 Output
-             (processed/{id}/result)
-                   │
-             Update DynamoDB
-            (status: COMPLETED)
-```
-
-- The worker does not use Hono.
-- Processing is deterministic and simple (e.g. word count, line count, or text transformation) without external AI/OCR dependencies.
+1. **Ingests & Validates**: Decodes URL-encoded S3 key from SQS record and extracts document ID.
+2. **Idempotent Claim**: Conditionally transitions state from `UPLOADED` to `PROCESSING`. If condition fails, inspects DynamoDB status: skips if `PROCESSING`, `COMPLETED`, or `FAILED`.
+3. **Reads from S3**: Fetches content from `uploads/{id}/original`.
+4. **Calculates Metrics**: Computes `lineCount`, `wordCount`, `characterCount`, and `originalSizeBytes`.
+5. **Writes Result**: Saves JSON payload to `processed/{id}/result`.
+6. **Updates DynamoDB**: Conditionally sets status to `COMPLETED` and records `processedS3Key`.
+7. **Error Handling**: Failures are re-thrown to trigger native SQS retry / DLQ redrive without application retry counters.
 
 ---
 
-## 7. DynamoDB Data Model
+## 7. DynamoDB Schema
 
-Designed strictly around single-table access patterns:
+Single-table design with primary key `id` (String):
 
-- **Primary Key**: `id` (String, Hash key)
-- **Document Attributes**:
-  - `id`: Unique document identifier (UUID)
-  - `filename`: Original document filename
-  - `contentType`: MIME type
-  - `size`: Size in bytes
-  - `status`: Lifecycle state (`UPLOADED` | `PROCESSING` | `COMPLETED` | `FAILED`)
-  - `s3Key`: Deterministic S3 key of the original upload
-  - `processedS3Key`: Deterministic S3 key of the processed result (optional)
-  - `createdAt`: ISO-8601 timestamp
-  - `updatedAt`: ISO-8601 timestamp
-
----
-
-## 8. Idempotency & State Machine
-
-```text
-UPLOADED ──(conditional claim)──> PROCESSING ──┬──> COMPLETED
-                                               └──> FAILED
-```
-
-- SQS offers at-least-once delivery; messages can be delivered more than once.
-- The worker claims a document using a **DynamoDB conditional write**:
-  ```text
-  attribute_exists(id) AND #status = :expectedStatus
-  ```
-- If the condition fails, the worker knows another execution already claimed the document, preventing duplicate processing.
+| Field            | Type              | Description                                           |
+| ---------------- | ----------------- | ----------------------------------------------------- |
+| `id`             | String (Hash Key) | Document UUID                                         |
+| `filename`       | String            | Original uploaded filename                            |
+| `contentType`    | String            | MIME type                                             |
+| `size`           | Number            | File size in bytes                                    |
+| `status`         | String            | `UPLOADED` \| `PROCESSING` \| `COMPLETED` \| `FAILED` |
+| `s3Key`          | String            | Original upload key                                   |
+| `processedS3Key` | String?           | Output result key                                     |
+| `createdAt`      | String            | ISO timestamp                                         |
+| `updatedAt`      | String            | ISO timestamp                                         |
 
 ---
 
-## 9. Retry Handling & DLQ
+## 8. Least-Privilege IAM
 
-- Failed worker executions reject and propagate the error.
-- SQS manages retries via native visibility timeouts and redrive policies.
-- After reaching `maxReceiveCount`, the message moves to the Dead Letter Queue.
-- No custom in-application retry loops or counters are implemented.
-
----
-
-## 10. Least-Privilege IAM
-
-IAM policies are strictly derived from actual runtime operations:
-
-- **API Lambda Role**:
-  - `dynamodb:PutItem`, `dynamodb:GetItem` on `DocumentsTable`
-  - `s3:PutObject` on `DocumentsBucket/uploads/*`
-  - `logs:CreateLogStream`, `logs:PutLogEvents` on dedicated Log Group
-- **Worker Lambda Role**:
-  - `dynamodb:GetItem`, `dynamodb:UpdateItem` on `DocumentsTable`
-  - `s3:GetObject` on `DocumentsBucket/uploads/*`
-  - `s3:PutObject` on `DocumentsBucket/processed/*`
-  - `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes` on `DocumentProcessingQueue`
-  - `logs:CreateLogStream`, `logs:PutLogEvents` on dedicated Log Group
-- **SQS Queue Policy**: Restricts `sqs:SendMessage` strictly to the S3 bucket source ARN.
+| Principal                      | Resource                                                                                                                          | Actions                                                                                                                                                                                             | Purpose                                                   |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| **`ApiFunctionRole`**          | `DocumentsTable`<br>`DocumentsBucket/uploads/*`<br>`ApiLogGroup`                                                                  | `dynamodb:PutItem`, `dynamodb:GetItem`<br>`s3:PutObject`<br>`logs:CreateLogStream`, `logs:PutLogEvents`                                                                                             | Create/read documents & issue upload URLs                 |
+| **`WorkerFunctionRole`**       | `DocumentsTable`<br>`DocumentsBucket/uploads/*`<br>`DocumentsBucket/processed/*`<br>`DocumentProcessingQueue`<br>`WorkerLogGroup` | `dynamodb:GetItem`, `dynamodb:UpdateItem`<br>`s3:GetObject`<br>`s3:PutObject`<br>`sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`<br>`logs:CreateLogStream`, `logs:PutLogEvents` | Claim, read, analyze, save result, and consume SQS events |
+| **`s3.amazonaws.com`**         | `DocumentProcessingQueue`                                                                                                         | `sqs:SendMessage`                                                                                                                                                                                   | S3 ObjectCreated notifications (scoped to bucket ARN)     |
+| **`apigateway.amazonaws.com`** | `ApiFunction`                                                                                                                     | `lambda:InvokeFunction`                                                                                                                                                                             | HTTP API request routing (scoped to API ARN)              |
 
 ---
 
-## 11. Infrastructure as Code (CloudFormation)
+## 9. Infrastructure as Code (CloudFormation)
 
-CloudFormation is the infrastructure source of truth:
-
-- **[`infra/bootstrap.yaml`](infra/bootstrap.yaml)**: One-time bootstrap stack creating the deployment artifacts S3 bucket with versioning, 30-day lifecycle expiration, and TLS enforcement.
-- **[`infra/template.yaml`](infra/template.yaml)**: Complete application stack:
-  - `AWS::DynamoDB::Table`
-  - `AWS::S3::Bucket`
-  - `AWS::ApiGatewayV2::Api`, `Integration`, `Route`, `Stage`
-  - `AWS::Lambda::Function`, `Permission`, `EventSourceMapping`
-  - `AWS::SQS::Queue`, `QueuePolicy`
-  - `AWS::IAM::Role`
-  - `AWS::Logs::LogGroup`
+- **[`infra/bootstrap.yaml`](infra/bootstrap.yaml)**: One-time deployment artifacts S3 bucket with TLS enforcement and 30-day lifecycle expiration (real AWS only; not used for local Floci).
+- **[`infra/template.yaml`](infra/template.yaml)**: Complete application stack (HTTP API, API & Worker Lambdas, S3 Bucket & Policy, SQS & DLQ, DynamoDB Table, IAM Roles, CloudWatch Log Groups with 14-day retention).
 
 ---
 
-## 12. Local Verification with Floci
+## 10. AWS Deployment
 
-[Floci](https://github.com/floci-io/floci) is used for manual local AWS behavior verification:
-
-- **Mandatory Separation**: Floci is **not** part of the automated test suite and contains **zero** application or CloudFormation code (`no if local`, `no if floci`).
-- **Workflow**:
-  ```bash
-  # Local packaging & deployment
-  $env:AWS_ENDPOINT_URL = "http://localhost:4566"
-  aws cloudformation package --template-file infra/template.yaml --output-template-file infra/packaged.yaml --s3-bucket <local-artifacts-bucket>
-  aws cloudformation deploy --template-file infra/packaged.yaml --stack-name serverless-doc-pipeline --capabilities CAPABILITY_NAMED_IAM
-  ```
-
----
-
-## 13. Unit Testing Strategy
-
-Unit tests are **100% offline** and do not require Docker, Floci, AWS credentials, or network access:
+### Commands
 
 ```bash
-# Run unit tests
-npm test
+# 1. Deploy Bootstrap Stack (creates deployment artifacts S3 bucket)
+aws cloudformation deploy \
+  --template-file infra/bootstrap.yaml \
+  --stack-name doc-pipeline-bootstrap
 
-# Run code style & static analysis
-npm run lint
-npm run format:check
-npm run typecheck
+# 2. Build TypeScript Lambda bundles
+npm run build
+
+# 3. Package CloudFormation template (uploads dist/ bundles to S3)
+aws cloudformation package \
+  --template-file infra/template.yaml \
+  --output-template-file infra/packaged.yaml \
+  --s3-bucket <DEPLOYMENT_BUCKET_NAME>
+
+# 4. Deploy pipeline stack
+aws cloudformation deploy \
+  --template-file infra/packaged.yaml \
+  --stack-name serverless-doc-pipeline \
+  --capabilities CAPABILITY_NAMED_IAM
+
+# 5. Retrieve API endpoint & stack outputs
+aws cloudformation describe-stacks \
+  --stack-name serverless-doc-pipeline \
+  --query "Stacks[0].Outputs"
 ```
-
-Test coverage includes:
-
-- Domain state transitions & invariants ([`tests/unit/document-status.test.ts`](tests/unit/document-status.test.ts))
-- DynamoDB repository conditional writes ([`tests/unit/document.repository.test.ts`](tests/unit/document.repository.test.ts))
-- S3 key generation & storage service ([`tests/unit/s3.service.test.ts`](tests/unit/s3.service.test.ts))
-- Document service orchestration ([`tests/unit/document.service.test.ts`](tests/unit/document.service.test.ts))
-- Hono HTTP routes & validation edge cases ([`tests/unit/api.test.ts`](tests/unit/api.test.ts))
-- API Lambda adapter boundary ([`tests/unit/api.handler.test.ts`](tests/unit/api.handler.test.ts))
 
 ---
 
-## 14. Project Structure
+## 11. Local Verification with Floci
+
+Used solely for manual verification. Contains zero Floci-specific application code. **No bootstrap stack is needed for Floci**; create a local bucket directly using `aws s3 mb`:
+
+```powershell
+# Point AWS CLI to local Floci
+$env:AWS_ENDPOINT_URL = "http://localhost:4566"
+
+# 1. Create local deployment bucket directly
+aws s3 mb s3://local-artifacts
+
+# 2. Build & package application
+npm run build
+aws cloudformation package --template-file infra/template.yaml --output-template-file infra/packaged.yaml --s3-bucket local-artifacts
+
+# 3. Deploy stack
+aws cloudformation deploy --template-file infra/packaged.yaml --stack-name serverless-doc-pipeline --capabilities CAPABILITY_NAMED_IAM
+```
+
+---
+
+## 12. Testing & Project Structure
+
+All unit tests run **100% offline** without AWS credentials, Floci, or Docker:
+
+```bash
+npm test             # Run unit tests
+npm run lint         # Check code quality
+npm run format:check # Verify Prettier style
+npm run typecheck    # Strict TypeScript validation
+npm run build        # Build Lambda bundles with esbuild
+```
 
 ```text
 src/
-├── api/
-│   ├── app.ts                  # Hono application factory & global error handler
-│   ├── routes/
-│   │   └── documents.ts        # POST /documents & GET /documents/:id routes
-│   └── validators/
-│       └── document.validator.ts # Boundary request validation
-├── clients/
-│   ├── dynamodb.client.ts      # AWS SDK v3 DynamoDB client factory
-│   └── s3.client.ts            # AWS SDK v3 S3 client factory
-├── handlers/
-│   ├── api.handler.ts          # API Gateway Lambda adapter (handle(app))
-│   └── worker.handler.ts       # SQS Worker Lambda handler
-├── repositories/
-│   └── document.repository.ts  # DynamoDB CRUD & conditional status updates
-├── services/
-│   ├── document.service.ts     # Document lifecycle orchestration
-│   └── s3.service.ts           # S3 presigned URLs & object operations
-├── storage/
-│   └── s3-keys.ts              # Deterministic S3 key formatting
-└── types/
-    ├── document.ts             # Domain Document model
-    └── document-status.ts      # DocumentStatus enum & transition state machine
+├── api/          # Hono app factory, routes (documents.ts), input validators
+├── clients/      # AWS SDK v3 client factories (DynamoDB DocumentClient, S3)
+├── handlers/     # Lambda adapters: api.handler.ts (handle(app)), worker.handler.ts
+├── repositories/ # DynamoDB repository with conditional writes
+├── services/     # DocumentService, S3StorageService, DocumentProcessor
+├── storage/      # Deterministic S3 key helpers & path traversal guards
+└── types/        # Domain interfaces & DocumentStatus state transitions
 
-infra/
-├── bootstrap.yaml              # Deployment artifacts S3 bucket
-└── template.yaml               # Complete CloudFormation infrastructure
-
-tests/
-└── unit/                       # Pure offline Vitest unit tests
+infra/            # CloudFormation template.yaml & bootstrap.yaml
+tests/unit/       # Offline Vitest suites (domain, repository, S3, API, worker, security)
 ```
 
 ---
 
-## 15. Known Limitations
+## 13. Limitations
 
-- **No In-Band OCR / Heavy Processing**: Document processing is deliberately simple (deterministic metadata/text analysis) to focus on the serverless architecture.
-- **Unauthenticated HTTP API**: API Gateway endpoints do not include Cognito/IAM authorizers to keep the focus on pipeline mechanics.
-- **Single-Region**: Configured for single-region deployment per stack.
+- **Text Processing Only**: Deterministic text metrics demo instead of heavy OCR/ML processing.
+- **Unauthenticated HTTP API**: Focuses on event-driven mechanics without Cognito/auth layers.
+- **Single-Region**: Designed for single-region deployment per stack.
