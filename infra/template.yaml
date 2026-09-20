@@ -182,6 +182,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - dynamodb:UpdateItem
+                  - dynamodb:GetItem
                 Resource: !GetAtt DocumentsTable.Arn
         - PolicyName: S3AccessPolicy
           PolicyDocument:

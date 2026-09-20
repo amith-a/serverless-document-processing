@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { DocumentAlreadyExistsError } from '../../repositories/document.repository.js';
 import type { DocumentService } from '../../services/document.service.js';
 import {
   validateCreateDocumentRequest,
@@ -21,8 +22,16 @@ export function createDocumentsRoute(documentService: DocumentService): Hono {
       return c.json({ error: validation.error }, 400);
     }
 
-    const result = await documentService.createDocument(validation.data);
-    return c.json(result, 201);
+    try {
+      const result = await documentService.createDocument(validation.data);
+      console.info(`[API] Document created: ${result.id}`);
+      return c.json(result, 201);
+    } catch (error) {
+      if (error instanceof DocumentAlreadyExistsError) {
+        return c.json({ error: 'Document already exists' }, 409);
+      }
+      throw error;
+    }
   });
 
   router.get('/:id', async (c) => {

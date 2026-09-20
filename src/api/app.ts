@@ -26,7 +26,11 @@ export function createApp(documentService?: DocumentService): Hono {
 
   app.route('/documents', createDocumentsRoute(service));
 
-  app.onError((_err, c) => {
+  app.onError((err, c) => {
+    console.error(
+      `[API] Unhandled error during ${c.req.method} ${c.req.path}:`,
+      err instanceof Error ? err.message : String(err),
+    );
     return c.json({ error: 'Internal Server Error' }, 500);
   });
 

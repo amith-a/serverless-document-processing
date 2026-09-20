@@ -95,6 +95,7 @@ async function processSqsRecord(
 
     try {
       await repository.updateStatus(documentId, 'UPLOADED', 'PROCESSING');
+      console.info(`[Worker] Started processing document ${documentId}`);
     } catch (error) {
       if (error instanceof ConditionalCheckFailedError) {
         const currentDoc = await repository.getById(documentId);
@@ -150,10 +151,11 @@ async function processSqsRecord(
         'COMPLETED',
         processedKey,
       );
+      console.info(`[Worker] Completed processing document ${documentId}`);
     } catch (error) {
       console.error(
         `[Worker] Failed processing document ${documentId}:`,
-        error,
+        error instanceof Error ? error.message : String(error),
       );
       // Re-throw so SQS triggers native retry/DLQ redrive
       throw error;

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../../src/api/app.js';
+import { DocumentAlreadyExistsError } from '../../src/repositories/document.repository.js';
 import type { DocumentRepository } from '../../src/repositories/document.repository.js';
 import { DocumentService } from '../../src/services/document.service.js';
 import type { S3StorageService } from '../../src/services/s3.service.js';
@@ -255,6 +256,26 @@ describe('HTTP API', () => {
       expect(json.error).toBe('Internal Server Error');
       expect(json.uploadUrl).toBeUndefined();
       expect(json.s3Key).toBeUndefined();
+    });
+
+    it('returns 409 Conflict when document ID collision occurs', async () => {
+      mockRepository.create.mockRejectedValue(
+        new DocumentAlreadyExistsError('doc-123'),
+      );
+
+      const res = await app.request('/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: 'invoice.pdf',
+          contentType: 'application/pdf',
+          size: 2048,
+        }),
+      });
+
+      expect(res.status).toBe(409);
+      const json = (await res.json()) as { error: string };
+      expect(json.error).toBe('Document already exists');
     });
   });
 
